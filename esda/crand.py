@@ -8,6 +8,7 @@ import warnings
 
 import numpy as np
 
+from .permutation_plan import PermutationPlan
 from .significance import _permutation_significance
 
 try:
@@ -68,6 +69,7 @@ def crand(
     seed=None,
     island_weight=0,
     alternative=None,
+    permutation_plan=None,
 ):
     """
     Conduct conditional randomization of a given input using the provided
@@ -115,6 +117,15 @@ def crand(
             * 'lesser'
             * 'directed' -- Current default behavior
             * 'folded'
+    permutation_plan : PermutationPlan, optional
+        A shared, stable-region-ID-bound permutation plan. When provided, the
+        same on-demand permutation blocks drive this call and every other
+        statistic consuming the plan, regardless of row order or serial /
+        parallel chunking. The plan is validated against ``w`` and ``z``
+        before any work and incompatible inputs are rejected. ``seed`` must
+        then be None and ``permutations`` must match the plan. Blocks are
+        streamed, so the full simulation cube is never materialised unless
+        ``keep`` is True.
 
     Returns
     -------
@@ -167,6 +178,27 @@ def crand(
             f"alternative='{alternative}' provided, but is not"
             " one of the supported options: 'two-sided', 'greater', "
             "'lesser', 'directed', 'folded')"
+        )
+
+    if permutation_plan is not None:
+        if seed is not None:
+            raise ValueError(
+                "Pass either `permutation_plan` or `seed`, not both: the plan "
+                "already records the random seed and mixing the two would "
+                "break reproducibility across shared statistics."
+            )
+        return _crand_with_plan(
+            z=z,
+            w=w,
+            observed=observed,
+            keep=keep,
+            n_jobs=n_jobs,
+            stat_func=stat_func,
+            scaling=scaling,
+            island_weight=island_weight,
+            alternative=alternative,
+            plan=permutation_plan,
+            permutations=permutations,
         )
 
     # paralellise over permutations?
@@ -574,6 +606,414 @@ def parallel_crand(
     p_sims = np.hstack(p_sims).squeeze()
     rlocals = np.vstack(rlocals).squeeze()
     return p_sims, rlocals
+
+
+#######################################################################
+#          Shared permutation-plan implementation (streamed)           #
+#######################################################################
+
+
+def _resolve_scaling(z, scaling):
+    """Replicate the default moran-like scaling used by ``crand``."""
+    n = len(z)
+    if scaling is not None:
+        return scaling
+    if z.ndim == 2:
+        if z.shape[1] == 2:
+            return (n - 1) / (z[:, 0] * z[:, 0]).sum()
+        elif z.shape[1] == 1:
+            return (n - 1) / (z * z).sum()
+        else:
+            raise NotImplementedError(
+                f"multivariable input is not yet supported in "
+                f"conditional randomization. Received `z` of shape {z.shape}"
+            )
+    elif z.ndim == 1:
+        return (n - 1) / (z * z).sum()
+    else:
+        raise NotImplementedError(
+            f"multivariable input is not yet supported in "
+            f"conditional randomization. Received `z` of shape {z.shape}"
+        )
+
+
+def _crand_with_plan(
+    z,
+    w,
+    observed,
+    keep,
+    n_jobs,
+    stat_func,
+    scaling,
+    island_weight,
+    alternative,
+    plan,
+    permutations,
+):
+    """
+    Run conditional randomisation consuming a shared :class:`PermutationPlan`.
+
+    Inputs are reordered into the plan's canonical region-ID order before
+    computation and outputs are mapped back to the caller's order, so a
+    permutation attached to a stable region ID is the same draw regardless
+    of the input row order. Permutation blocks are generated on demand and
+    reduced into tail counters (or an optional simulation matrix), so the
+    full ``(n, permutations)`` cube is never held when ``keep`` is False.
+    """
+    if not isinstance(plan, PermutationPlan):
+        raise TypeError(
+            "`permutation_plan` must be a PermutationPlan instance; got "
+            f"{type(plan)!r}."
+        )
+    if permutations != plan.permutations:
+        raise ValueError(
+            f"PermutationPlan covers {plan.permutations} permutations but "
+            f"{permutations} were requested. Reuse the plan as built or "
+            "rebuild it with the matching count."
+        )
+    # Reject incompatible weights / candidate population before any draw.
+    plan.check_compatible(w, z)
+
+    z = np.asarray(z)
+    observed = np.asarray(observed, dtype=np.float64).flatten()
+    scaling = _resolve_scaling(z, scaling)
+
+    # Reorder every input into the plan's canonical order, which is defined
+    # by the sorted stable region identifiers. This makes a draw attached to
+    # a stable ID identical across callers that supplied different row
+    # orders; ``inverse_order`` maps canonical results back to caller order.
+    id_order = (
+        w.id_order if hasattr(w, "id_order") else w.unique_ids
+    )
+    canonical_order = plan.canonical_positions(id_order)
+    inverse_order = np.argsort(canonical_order)
+
+    z_canonical = z[canonical_order]
+    observed_canonical = observed[canonical_order]
+
+    adj_matrix = w.sparse[canonical_order, :][:, canonical_order]
+    self_weights = adj_matrix.diagonal()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        adj_matrix.setdiag(0)
+        adj_matrix.eliminate_zeros()
+    other_weights = adj_matrix.data.astype(z_canonical.dtype)
+    cardinalities = np.array((adj_matrix != 0).sum(1)).flatten()
+
+    if plan.max_cardinality != int(cardinalities.max(initial=0)):
+        raise ValueError(
+            "PermutationPlan max_cardinality "
+            f"({plan.max_cardinality}) does not match the maximum neighbor "
+            f"cardinality of the provided weights ({int(cardinalities.max())})."
+        )
+
+    if n_jobs != 1 and not importlib.util.find_spec("joblib"):
+        warnings.warn(
+            f"Parallel processing is requested (n_jobs={n_jobs}),"
+            f" but joblib cannot be imported. n_jobs will be set"
+            f" to 1.",
+            stacklevel=2,
+        )
+        n_jobs = 1
+
+    common = dict(
+        z=z_canonical,
+        observed=observed_canonical,
+        cardinalities=cardinalities,
+        self_weights=self_weights,
+        other_weights=other_weights,
+        scaling=scaling,
+        stat_func=stat_func,
+        island_weight=island_weight,
+        alternative=alternative,
+        plan=plan,
+        # After canonical reordering, local position i already coincides with
+        # canonical position i, so the focal mapping is the identity.
+        focal_canonical=np.arange(len(z_canonical), dtype=np.int64),
+    )
+
+    if n_jobs == 1:
+        p_sims, rlocals = _stream_plan_crand_serial(keep=keep, **common)
+    else:
+        if n_jobs == -1:
+            n_jobs = os.cpu_count()
+        n_jobs = min(n_jobs, len(z_canonical), plan.n_blocks)
+        n_jobs = max(n_jobs, 1)
+        p_sims, rlocals = _stream_plan_crand_parallel(
+            keep=keep, n_jobs=n_jobs, **common
+        )
+
+    # Map results back to the caller's original region order.
+    p_sims = np.asarray(p_sims, dtype=np.float32)[inverse_order]
+    if keep:
+        rlocals = np.asarray(rlocals)[inverse_order, :]
+    return p_sims, rlocals
+
+
+def _empty_tail_state(n, permutations, keep):
+    """Allocate streaming tail counters and the optional simulation cube."""
+    greater = np.zeros(n, dtype=np.int64)
+    lesser = np.zeros(n, dtype=np.int64)
+    rlocals = np.empty((n, permutations), dtype=np.float64) if keep else None
+    return greater, lesser, rlocals
+
+
+@njit(fastmath=False)
+def _remap_rows_for_focal(block, focal_canonical_i, out):
+    """
+    Remap a stable-canonical-position block into the excluded-position
+    space of one focal site, in place into ``out``.
+
+    Plan blocks index the full candidate population in canonical (stable-ID)
+    order, so a draw denotes the same region regardless of the caller's row
+    order. The kernel receives every input pre-reordered into that canonical
+    order, hence local and canonical positions coincide and the statistic's
+    masked array simply omits the focal row. Canonical position ``p`` then
+    maps to ``p`` when ``p < focal_canonical_i`` and to ``p - 1`` when
+    ``p > focal_canonical_i``; the focal position itself never appears
+    because the focal region is excluded from its own candidate set.
+    """
+    p_permutations, max_cardinality = block.shape
+    for k in range(p_permutations):
+        for j in range(max_cardinality):
+            p = block[k, j]
+            out[k, j] = p - 1 if p > focal_canonical_i else p
+    return out
+
+
+@njit(parallel=False, fastmath=True)
+def compute_chunk_plan(
+    z,
+    observed,
+    cardinalities,
+    self_weights,
+    other_weights,
+    block,
+    scaling,
+    keep,
+    stat_func,
+    island_weight,
+    alternative,
+    focal_canonical,
+):
+    """
+    Compute one on-demand plan block for every focal site.
+
+    Unlike :func:`compute_chunk`, the block carries stable canonical
+    positions and is remapped per focal site before invoking the statistic,
+    which is what makes draws invariant to analysis-order reordering.
+    ``focal_canonical[i]`` is the canonical position of the region at local
+    position ``i``; it equals ``i`` because inputs are pre-reordered into
+    the plan's canonical order, but is passed explicitly so the remap stays
+    independent of any downstream chunking.
+
+    Tail counters are returned instead of a block-local p-value, so blocks
+    can be streamed without retaining the full simulation cube.
+    """
+    n_samples = z.shape[0]
+    p_permutations, max_cardinality = block.shape
+    greater = np.zeros((n_samples,), dtype=np.int64)
+    lesser = np.zeros((n_samples,), dtype=np.int64)
+    rlocals = (
+        np.empty((n_samples, p_permutations), dtype=np.float64)
+        if keep
+        else np.empty((1, 1))
+    )
+    remapped = np.empty_like(block)
+    wloc = 0
+
+    for i in range(n_samples):
+        cardinality = cardinalities[i]
+        if cardinality == 0:  # deal with islands
+            weights_i = np.zeros(2, dtype=other_weights.dtype)
+            weights_i[1] = island_weight
+        else:
+            weights_i = np.zeros(cardinality + 1, dtype=other_weights.dtype)
+            weights_i[0] = self_weights[i]
+            weights_i[1:] = other_weights[wloc : (wloc + cardinality)]
+        wloc += cardinality
+        _remap_rows_for_focal(block, focal_canonical[i], remapped)
+        rstats = stat_func(i, z, remapped, weights_i, scaling)
+        if alternative == "greater" or alternative == "two-sided" or (
+            alternative == "directed"
+        ):
+            greater[i] = np.sum(rstats >= observed[i])
+        if alternative == "lesser" or alternative == "two-sided" or (
+            alternative == "directed"
+        ):
+            lesser[i] = np.sum(rstats <= observed[i])
+        if keep:
+            rlocals[i] = rstats
+
+    return greater, lesser, rlocals
+
+
+def _finalize_pvalues(
+    greater, lesser, observed, rlocals, alternative, permutations
+):
+    """Turn streamed counters into pseudo p-values using the existing rules."""
+    denom = permutations + 1.0
+    if alternative == "directed":
+        larger = greater.copy()
+        low_extreme = (permutations - larger) < larger
+        larger[low_extreme] = permutations - larger[low_extreme]
+        p_value = (larger + 1.0) / denom
+    elif alternative == "lesser":
+        p_value = (lesser + 1.0) / denom
+    elif alternative == "greater":
+        p_value = (greater + 1.0) / denom
+    elif alternative == "two-sided":
+        p_value = np.minimum(
+            2.0 * (np.minimum(greater, lesser) + 1.0) / denom, 1.0
+        )
+    elif alternative == "folded":
+        # Same folded tail rule as _permutation_significance: fold both
+        # observed and simulated values about the simulated mean, then count
+        # simulated folds at least as extreme as the observed fold. Computed
+        # in vectorised form to match the streaming dtypes/shapes.
+        means = rlocals.mean(axis=1, keepdims=True)
+        folded_test_stat = np.abs(observed[:, None] - means)
+        folded_reference = np.abs(rlocals - means)
+        p_value = (
+            (folded_reference >= folded_test_stat).sum(axis=1) + 1.0
+        ) / denom
+    else:  # pragma: no cover - validated upstream in crand()
+        raise ValueError(f"unsupported alternative {alternative!r}")
+    return p_value.astype(np.float32)
+
+
+def _stream_plan_crand_serial(
+    z,
+    observed,
+    cardinalities,
+    self_weights,
+    other_weights,
+    scaling,
+    stat_func,
+    island_weight,
+    alternative,
+    plan,
+    keep,
+    focal_canonical,
+):
+    """Serial sweep over on-demand plan blocks with streaming reduction."""
+    n = z.shape[0]
+    greater, lesser, rlocals = _empty_tail_state(
+        n, plan.permutations, keep
+    )
+    for start, block in plan.iter_blocks():
+        stop = start + block.shape[0]
+        b_greater, b_lesser, b_rlocals = compute_chunk_plan(
+            z,
+            observed,
+            cardinalities,
+            self_weights,
+            other_weights,
+            block,
+            scaling,
+            keep,
+            stat_func,
+            island_weight,
+            alternative,
+            focal_canonical,
+        )
+        greater += b_greater
+        lesser += b_lesser
+        if keep:
+            rlocals[:, start:stop] = b_rlocals
+    p_sims = _finalize_pvalues(
+        greater, lesser, observed, rlocals, alternative, plan.permutations
+    )
+    return p_sims, rlocals if keep else np.empty((1, 1))
+
+
+def _plan_block_worker(
+    block_index,
+    start,
+    z,
+    observed,
+    cardinalities,
+    self_weights,
+    other_weights,
+    scaling,
+    stat_func,
+    island_weight,
+    alternative,
+    plan,
+    keep,
+    focal_canonical,
+):
+    """Compute one plan block; module-level so joblib workers can pickle it."""
+    block = plan.get_block(block_index)
+    b_greater, b_lesser, b_rlocals = compute_chunk_plan(
+        z,
+        observed,
+        cardinalities,
+        self_weights,
+        other_weights,
+        block,
+        scaling,
+        keep,
+        stat_func,
+        island_weight,
+        alternative,
+        focal_canonical,
+    )
+    return start, b_greater, b_lesser, b_rlocals
+
+
+def _stream_plan_crand_parallel(
+    z,
+    observed,
+    cardinalities,
+    self_weights,
+    other_weights,
+    scaling,
+    stat_func,
+    island_weight,
+    alternative,
+    plan,
+    keep,
+    n_jobs,
+    focal_canonical,
+):
+    """Parallel sweep over plan blocks with an order-independent reduction."""
+    from joblib import Parallel, delayed, parallel_backend
+
+    n = z.shape[0]
+    greater, lesser, rlocals = _empty_tail_state(
+        n, plan.permutations, keep
+    )
+    with parallel_backend("loky", inner_max_num_threads=1):
+        worker_out = Parallel(n_jobs=n_jobs)(
+            delayed(_plan_block_worker)(
+                block_index,
+                plan.block_bounds(block_index)[0],
+                z,
+                observed,
+                cardinalities,
+                self_weights,
+                other_weights,
+                scaling,
+                stat_func,
+                island_weight,
+                alternative,
+                plan,
+                keep,
+                focal_canonical,
+            )
+            for block_index in range(plan.n_blocks)
+        )
+    for start, b_greater, b_lesser, b_rlocals in worker_out:
+        greater += b_greater
+        lesser += b_lesser
+        if keep:
+            stop = start + b_rlocals.shape[1]
+            rlocals[:, start:stop] = b_rlocals
+    p_sims = _finalize_pvalues(
+        greater, lesser, observed, rlocals, alternative, plan.permutations
+    )
+    return p_sims, rlocals if keep else np.empty((1, 1))
 
 
 #######################################################################

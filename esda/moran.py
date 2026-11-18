@@ -1321,6 +1321,12 @@ class Moran_Local:
     alternative : None | str = None
         The alternative hypothesis for conditional randomization.
         See ``crand.crand()`` for complete description.
+    permutation_plan : PermutationPlan, optional
+        A shared permutation plan bound to the stable region IDs of ``w``.
+        When supplied, ``seed`` must be None and the same plan can be passed
+        to other local statistics so that all consume an identical random
+        world, including after row reordering or serial/parallel changes.
+        See :class:`esda.permutation_plan.PermutationPlan`.
 
     Notes
     -----
@@ -1373,6 +1379,7 @@ class Moran_Local:
         seed=None,
         island_weight=0,  # noqa: ARG002 - Unused method argument: `island_weight`
         alternative=None,
+        permutation_plan=None,
     ):
         y = np.asarray(y).flatten()
         self.y = y
@@ -1411,6 +1418,7 @@ class Moran_Local:
                 stat_func=_moran_local_crand,
                 seed=seed,
                 alternative=alternative,
+                permutation_plan=permutation_plan,
             )
             self.sim = np.transpose(self.rlisas)
             if keep_simulations:
@@ -1905,6 +1913,7 @@ class Moran_Local_BV:
         seed=None,
         island_weight=0,  # noqa: ARG002 - Unused method argument: `island_weight`
         alternative=None,
+        permutation_plan=None,
     ):
         x = np.asarray(x).flatten()
         y = np.asarray(y).flatten()
@@ -1949,6 +1958,7 @@ class Moran_Local_BV:
                 stat_func=_moran_local_bv_crand,
                 seed=seed,
                 alternative=alternative,
+                permutation_plan=permutation_plan,
             )
             self.sim = np.transpose(self.rlisas)
             if keep_simulations:
@@ -2379,6 +2389,7 @@ class Moran_Local_Rate(Moran_Local):
         seed=None,
         island_weight=0,  # noqa: ARG002 - Unused method argument: `island_weight`
         alternative=None,
+        permutation_plan=None,
     ):
         e = np.asarray(e).flatten()
         b = np.asarray(b).flatten()
@@ -2394,6 +2405,7 @@ class Moran_Local_Rate(Moran_Local):
             keep_simulations=keep_simulations,
             seed=seed,
             alternative=alternative,
+            permutation_plan=permutation_plan,
         )
 
     @classmethod

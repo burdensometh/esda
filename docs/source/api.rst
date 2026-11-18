@@ -210,6 +210,18 @@ Topology
     prominence
 
 
+Permutation Plans
+-----------------
+
+Shared conditional-randomisation designs bound to stable region identifiers.
+
+.. autosummary::
+   :toctree: generated/
+
+    PermutationPlan
+    PLAN_WEIGHTS_VERSION
+
+
 Utility Functions
 -----------------
 

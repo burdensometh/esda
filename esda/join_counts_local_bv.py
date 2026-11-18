@@ -23,6 +23,7 @@ class Join_Counts_Local_BV(BaseEstimator):
         island_weight=0,
         drop_islands=True,
         alternative=None,
+        permutation_plan=None,
     ):
         """
         Initialize a Local_Join_Counts_BV estimator
@@ -67,6 +68,7 @@ class Join_Counts_Local_BV(BaseEstimator):
         self.island_weight = island_weight
         self.drop_islands = drop_islands
         self.alternative = alternative
+        self.permutation_plan = permutation_plan
 
     def fit(self, x, z, case="CLC", n_jobs=1, permutations=999):
         """
@@ -204,6 +206,7 @@ class Join_Counts_Local_BV(BaseEstimator):
                     seed=self.seed,
                     island_weight=self.island_weight,
                     alternative=self.alternative,
+                    permutation_plan=self.permutation_plan,
                 )
                 # Set p-values for those with LJC of 0 to NaN
                 self.p_sim[self.LJC == 0] = "NaN"
@@ -219,6 +222,7 @@ class Join_Counts_Local_BV(BaseEstimator):
                     seed=self.seed,
                     island_weight=self.island_weight,
                     alternative=self.alternative,
+                    permutation_plan=self.permutation_plan,
                 )
                 # Set p-values for those with LJC of 0 to NaN
                 self.p_sim[self.LJC == 0] = "NaN"

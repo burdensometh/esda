@@ -40,6 +40,7 @@ from .moran import (
     plot_moran_facet,
 )
 from .moran_local_mv import MoranLocalConditional, MoranLocalPartial
+from .permutation_plan import PLAN_WEIGHTS_VERSION, PermutationPlan
 from .silhouettes import boundary_silhouette, path_silhouette
 from .smaup import Smaup
 from .topo import isolation, prominence

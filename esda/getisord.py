@@ -360,6 +360,7 @@ class G_Local:
         seed=None,
         island_weight=0,
         alternative=None,
+        permutation_plan=None,
     ):
         y = np.asarray(y).flatten()
         self.n = len(y)
@@ -388,6 +389,7 @@ class G_Local:
                 seed=seed,
                 island_weight=island_weight,
                 alternative=alternative,
+                permutation_plan=permutation_plan,
             )
             if keep_simulations:
                 self.sim = sim = self.rGs.T

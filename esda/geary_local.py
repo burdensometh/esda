@@ -23,6 +23,7 @@ class Geary_Local(BaseEstimator):
         island_weight=0,
         drop_islands=True,
         alternative=None,
+        permutation_plan=None,
     ):
         """
         Initialize a Local_Geary estimator
@@ -97,6 +98,7 @@ class Geary_Local(BaseEstimator):
         self.island_weight = island_weight
         self.drop_islands = drop_islands
         self.alternative = alternative
+        self.permutation_plan = permutation_plan
 
     def fit(self, x):
         """
@@ -159,6 +161,7 @@ class Geary_Local(BaseEstimator):
                 seed=self.seed,
                 island_weight=self.island_weight,
                 alternative=self.alternative,
+                permutation_plan=self.permutation_plan,
             )
 
         if self.labels:
